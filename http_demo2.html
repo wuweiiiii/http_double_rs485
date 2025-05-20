@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>柴油机监控系统 REST前端</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: "Consolas", "Menlo", "monospace", "微软雅黑"; background: #fafbfc; margin: 0; padding: 20px; }
+    .card { background: #fff; border: 1px solid #eee; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 8px #0001; max-width: 950px; }
+    h2 { font-size: 22px; margin: 0 0 10px 0;}
+    table { border-collapse: collapse; margin-top: 10px; width: 100%;}
+    th, td { border: 1px solid #ddd; padding: 5px 10px;}
+    th { background: #f2f2f2; }
+    .btn { padding: 4px 18px; border: 1px solid #888; border-radius: 6px; background: #fafbfc; cursor:pointer; }
+    .btn:active { background: #eee; }
+    .row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap;}
+    input[type="datetime-local"] { padding: 2px 8px;}
+    .ml4 { margin-left: 16px; }
+    .text-red { color: #b21c1c;}
+    .text-grey { color: #999;}
+    select { padding: 2px 10px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h2>柴油机监控 REST 前端</h2>
+  <div style="margin-bottom:14px;">
+    <label>API地址:
+      <input type="text" id="api_base" value="http://192.168.100.4:8080" style="width:220px; padding:2px 6px;"/>
+    </label>
+    <span class="ml4">
+      查询表：
+      <select id="tableSelect" onchange="onTableChange()">
+        <option value="lop1_frame1">lop1_frame1</option>
+        <option value="lop1_frame2">lop1_frame2</option>
+      </select>
+    </span>
+    <button class="btn ml4" onclick="getRealtime()">刷新实时数据</button>
+  </div>
+  <div>
+    <b>实时数据:</b>
+    <span id="realtimeResult" class="ml4 text-grey">等待加载...</span>
+  </div>
+</div>
+
+<div class="card">
+  <b>历史数据查询：</b>
+  <div class="row" style="margin-bottom:6px;" id="fieldCheckboxes"></div>
+  <div class="row" style="margin-bottom:10px;">
+    <div>
+      开始时间
+      <input type="datetime-local" id="historyStart">
+    </div>
+    <div>
+      结束时间
+      <input type="datetime-local" id="historyEnd">
+    </div>
+    <button class="btn" onclick="loadHistory(0)">查询</button>
+    <button class="btn" onclick="prevPage()">上一页</button>
+    <button class="btn" onclick="nextPage()">下一页</button>
+    <span>第 <span id="pageNo">1</span> 页</span>
+    <button class="btn ml4" onclick="downloadAllHistoryJson()" id="downloadBtn" style="display:none;">导出全部JSON</button>
+  </div>
+  <div id="historyTableBox" style="overflow:auto;max-height:400px;"></div>
+  <div id="historyError" class="text-red"></div>
+</div>
+
+<div class="card">
+  <b>历史数据删除：</b>
+  <div class="row" style="margin-bottom:10px;">
+    <div>
+      开始时间
+      <input type="datetime-local" id="delStart">
+    </div>
+    <div>
+      结束时间
+      <input type="datetime-local" id="delEnd">
+    </div>
+    <button class="btn" onclick="deleteHistory()">删除</button>
+    <span id="delResult" class="ml4 text-red"></span>
+  </div>
+</div>
+
+<script>
+// 每个表的字段
+const tableFields = {
+  "lop1_frame1": ["id","device_id","frame_hex","rpm1","oil_pressure","freshwater_temp","a排排温","b排排温","齿油温","齿油压","海水压","active_alarms","received_time"],
+  "lop1_frame2": ["id","device_id","frame_hex","rpm2","oil_temp","inlet_temp","inlet_pressure","燃油压","淡水压","active_alarms","received_time"]
+};
+let page = 0, limit = 50;
+let lastHistory = [], lastColumns = [];
+let currentTable = document.getElementById('tableSelect').value;
+let selectedFields = [];
+
+function nowStr(offsetHour=0) {
+  const d = new Date(Date.now() + offsetHour * 3600 * 1000);
+  const pad = n => (n<10?'0':'')+n;
+  return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+pad(d.getHours())+":"+pad(d.getMinutes())+":00";
+}
+function toDatetimeLocalStr(s) { return s.replace(' ', 'T').slice(0, 16);}
+function ensureDatetime(val) { if (!val) return ''; let out = val.replace('T', ' '); if (out.length === 16) out += ':00'; return out; }
+document.getElementById('historyStart').value = toDatetimeLocalStr(nowStr(-1));
+document.getElementById('historyEnd').value = toDatetimeLocalStr(nowStr(0));
+document.getElementById('delStart').value = toDatetimeLocalStr(nowStr(-24));
+document.getElementById('delEnd').value = toDatetimeLocalStr(nowStr(0));
+
+function getAPI() { return document.getElementById('api_base').value.replace(/\/+\$/,''); }
+
+function renderFieldCheckboxes() {
+  const fields = tableFields[currentTable] || [];
+  let html = "<b>查询字段：</b>";
+  fields.forEach(f => {
+    html += `<label style="margin-right:8px;">
+      <input type="checkbox" class="fieldCheck" value="${f}" checked onchange="onFieldChange()"> ${f}
+    </label>`;
+  });
+  document.getElementById('fieldCheckboxes').innerHTML = html;
+  selectedFields = fields.slice();
+}
+function onFieldChange() {
+  selectedFields = Array.from(document.querySelectorAll('.fieldCheck:checked')).map(c=>c.value);
+}
+window.onFieldChange = onFieldChange;
+
+function onTableChange() {
+  currentTable = document.getElementById('tableSelect').value;
+  renderFieldCheckboxes();
+  getRealtime();
+  loadHistory(0);
+}
+function getCurrentFields() {
+  return selectedFields && selectedFields.length ? selectedFields : (tableFields[currentTable] || []);
+}
+
+function getRealtime() {
+  document.getElementById('realtimeResult').innerText = "加载中...";
+  fetch(getAPI() + "/api/data/realtime", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({table: currentTable, fields: getCurrentFields()})
+  }).then(r=>r.json()).then(res=>{
+    if (res.data && res.data[0]) {
+      const out = getCurrentFields().map((f,i)=>f+":"+res.data[0][i]).join(' | ');
+      document.getElementById('realtimeResult').innerText = out;
+    } else {
+      document.getElementById('realtimeResult').innerText = res.message || "无数据";
+    }
+  }).catch(err=>{
+    document.getElementById('realtimeResult').innerText = "请求失败：" + err;
+  });
+}
+getRealtime();
+renderFieldCheckboxes();
+
+function loadHistory(p=0) {
+  page = p;
+  document.getElementById('pageNo').innerText = page+1;
+  document.getElementById('historyTableBox').innerText = "加载中...";
+  document.getElementById('historyError').innerText = "";
+  const start = ensureDatetime(document.getElementById('historyStart').value);
+  const end = ensureDatetime(document.getElementById('historyEnd').value);
+  if (!start || !end) {
+    document.getElementById('historyError').innerText = "请填写正确的起止时间";
+    document.getElementById('downloadBtn').style.display = "none";
+    return;
+  }
+  fetch(getAPI() + "/api/data/query", {
+    method:"POST", headers:{"Content-Type": "application/json"},
+    body: JSON.stringify({
+      table: currentTable, fields: getCurrentFields(),
+      filter:{time_range:{start,end}},
+      sort:{field:"received_time", order:"DESC"},
+      pagination:{offset: page*limit, limit}
+    })
+  }).then(r=>r.json()).then(res=>{
+    if (res.data && res.data.length) {
+      lastHistory = res.data; lastColumns = res.columns || getCurrentFields();
+      renderHistoryTable();
+      document.getElementById('downloadBtn').style.display = "";
+    } else {
+      document.getElementById('historyTableBox').innerHTML = '<span class="text-red">无数据</span>';
+      document.getElementById('downloadBtn').style.display = "none";
+      lastHistory = [];
+    }
+    if(res.status !== "success") {
+      document.getElementById('historyError').innerText = res.message || "查询失败";
+    }
+  }).catch(err=>{
+    document.getElementById('historyError').innerText = "请求失败：" + err;
+    document.getElementById('historyTableBox').innerHTML = '';
+    document.getElementById('downloadBtn').style.display = "none";
+  });
+}
+function renderHistoryTable() {
+  let html = "<table><tr>";
+  lastColumns.forEach(h=>{ html += `<th>${h}</th>`; });
+  html += "</tr>";
+  lastHistory.forEach(row=>{
+    html += "<tr>";
+    row.forEach(cell=>{ html += `<td>${cell}</td>`; });
+    html += "</tr>";
+  });
+  html += "</table>";
+  document.getElementById('historyTableBox').innerHTML = html;
+}
+function prevPage() { if(page>0){ loadHistory(page-1);} }
+function nextPage() { loadHistory(page+1); }
+
+function deleteHistory() {
+  document.getElementById('delResult').innerText = "处理中...";
+  const start = ensureDatetime(document.getElementById('delStart').value);
+  const end = ensureDatetime(document.getElementById('delEnd').value);
+  if (!start || !end) {
+    document.getElementById('delResult').innerText = "请填写正确的起止时间";
+    return;
+  }
+  fetch(getAPI() + "/api/data/delete", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      table: currentTable,
+      filter: { time_range: { start, end } }
+    })
+  }).then(r=>r.json()).then(res=>{
+    document.getElementById('delResult').innerText = res.status === "success"
+      ? `已删除${res.deleted||0}条`
+      : "删除失败：" + (res.message||"未知错误");
+  }).catch(err=>{
+    document.getElementById('delResult').innerText = "请求失败：" + err;
+  });
+}
+
+function downloadAllHistoryJson() {
+  const start = ensureDatetime(document.getElementById('historyStart').value);
+  const end = ensureDatetime(document.getElementById('historyEnd').value);
+  if (!start || !end) {
+    alert("请填写正确的起止时间");
+    return;
+  }
+  const allRows = [];
+  let exportBtn = document.getElementById('downloadBtn');
+  exportBtn.innerText = "正在导出...";
+  exportBtn.disabled = true;
+
+  function fetchPage(offset) {
+    fetch(getAPI() + "/api/data/query", {
+      method:"POST", headers:{"Content-Type": "application/json"},
+      body: JSON.stringify({
+        table: currentTable, fields: getCurrentFields(),
+        filter:{time_range:{start,end}},
+        sort:{field:"received_time", order:"DESC"},
+        pagination:{offset, limit}
+      })
+    }).then(r=>r.json()).then(res=>{
+      if (res.data && res.data.length) {
+        if (!allRows.length) window._json_columns = res.columns || getCurrentFields();
+        for (let row of res.data) allRows.push(row);
+        if (res.data.length === limit) {
+          fetchPage(offset + limit); // 还有下一页
+        } else {
+          finishDownload();
+        }
+      } else {
+        finishDownload();
+      }
+    }).catch(err=>{
+      alert("导出失败：" + err);
+      exportBtn.innerText = "导出全部JSON";
+      exportBtn.disabled = false;
+    });
+  }
+  function finishDownload() {
+    if (!allRows.length) {
+      alert("没有数据可导出！");
+      exportBtn.innerText = "导出全部JSON";
+      exportBtn.disabled = false;
+      return;
+    }
+    const columns = window._json_columns || getCurrentFields();
+    const arr = allRows.map(row => {
+      const obj = {};
+      columns.forEach((h, i) => { obj[h] = row[i]; });
+      return obj;
+    });
+    const jsonStr = JSON.stringify(arr, null, 2);
+    const blob = new Blob([jsonStr], {type: "application/json"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = currentTable + "_" + start.replace(/[^0-9]/g,"").slice(0,10) + "-" + end.replace(/[^0-9]/g,"").slice(0,10) + ".json";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    exportBtn.innerText = "导出全部JSON";
+    exportBtn.disabled = false;
+  }
+  fetchPage(0);
+}
+</script>
+</body>
+</html>
